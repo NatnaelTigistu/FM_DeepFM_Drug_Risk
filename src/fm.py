@@ -166,6 +166,116 @@ def bce_loss(p: np.ndarray, y: np.ndarray, eps: float = 1e-12) -> float:
     return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
 
 
+# ── inference ─────────────────────────────────────────────────────────────────
+
+def predict_pair(
+    model: "FM",
+    drug1: str,
+    drug2: str,
+    drug_to_id: dict,
+    threshold: float = 0.5,
+) -> dict:
+    """
+    Given two drug names, return the model's prediction.
+
+    Parameters
+    ----------
+    model      : a loaded FM instance (use FM.load to avoid retraining)
+    drug1      : name of Drug 1  (must be in training vocabulary)
+    drug2      : name of Drug 2
+    drug_to_id : dict mapping drug name → integer ID  (from drug_mapping.json)
+    threshold  : classification threshold (default 0.5; use val-tuned value)
+
+    Returns
+    -------
+    dict with keys: drug1, drug2, logit, probability, predicted_class
+    """
+    if drug1 not in drug_to_id:
+        raise KeyError(f"Drug '{drug1}' not in training vocabulary.")
+    if drug2 not in drug_to_id:
+        raise KeyError(f"Drug '{drug2}' not in training vocabulary.")
+
+    i = drug_to_id[drug1]
+    j = drug_to_id[drug2]
+
+    idx1 = np.array([i], dtype=np.int32)
+    idx2 = np.array([j], dtype=np.int32)
+
+    logit = float(model.forward(idx1, idx2)[0])
+    prob  = float(sigmoid(np.array([logit]))[0])
+
+    return {
+        "drug1":           drug1,
+        "drug2":           drug2,
+        "logit":           logit,
+        "probability":     prob,
+        "predicted_class": int(prob >= threshold),
+    }
+
+
+def explain_pair(
+    model: "FM",
+    drug1: str,
+    drug2: str,
+    drug_to_id: dict,
+    threshold: float = 0.5,
+) -> dict:
+    """
+    Break the FM score into its four additive components for one drug pair.
+
+    z = b  +  w1[i]  +  w2[j]  +  dot(v1[i], v2[j])
+    p = sigmoid(z)
+
+    Returns a dict with every component plus the final logit and probability.
+    """
+    if drug1 not in drug_to_id:
+        raise KeyError(f"Drug '{drug1}' not in training vocabulary.")
+    if drug2 not in drug_to_id:
+        raise KeyError(f"Drug '{drug2}' not in training vocabulary.")
+
+    i = drug_to_id[drug1]
+    j = drug_to_id[drug2]
+
+    bias    = model.b
+    w1_term = float(model.w1[i])
+    w2_term = float(model.w2[j])
+    dot     = float(np.dot(model.v1[i], model.v2[j]))
+    logit   = bias + w1_term + w2_term + dot
+    prob    = float(sigmoid(np.array([logit]))[0])
+
+    return {
+        "drug1":           drug1,
+        "drug2":           drug2,
+        "bias":            bias,
+        "w1_term":         w1_term,
+        "w2_term":         w2_term,
+        "dot_product":     dot,
+        "logit":           logit,
+        "probability":     prob,
+        "predicted_class": int(prob >= threshold),
+    }
+
+
+def print_explanation(explanation: dict, threshold: float = 0.5) -> None:
+    """Pretty-print an explanation dict from explain_pair."""
+    e = explanation
+    print("=" * 52)
+    print(f"  Drug 1 : {e['drug1']}")
+    print(f"  Drug 2 : {e['drug2']}")
+    print("=" * 52)
+    print(f"  bias            b         = {e['bias']:+.6f}")
+    print(f"  linear weight   w1[i]     = {e['w1_term']:+.6f}")
+    print(f"  linear weight   w2[j]     = {e['w2_term']:+.6f}")
+    print(f"  interaction     dot(v,v') = {e['dot_product']:+.6f}")
+    print(f"  {'─'*44}")
+    print(f"  logit           z         = {e['logit']:+.6f}")
+    print(f"  probability     p=σ(z)    = {e['probability']:.6f}")
+    print(f"  threshold                 = {threshold}")
+    print(f"  prediction                = "
+          f"{'Severe (1)' if e['predicted_class'] else 'Not Severe (0)'}")
+    print("=" * 52)
+
+
 # ── numerical gradient check ──────────────────────────────────────────────────
 
 def numerical_gradient_check(
