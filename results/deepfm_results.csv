@@ -1,0 +1,2 @@
+model,library,split_ratio,embedding_dim_k,hidden_layers,dropout,learning_rate,epochs,threshold,val_f1,test_accuracy,test_precision,test_recall,test_f1
+DeepFM,PyTorch,70/15/15,32,"(64, 32)",0.0,0.001,20,0.5,0.897158,0.969662,0.914916,0.896091,0.905405

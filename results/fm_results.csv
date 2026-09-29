@@ -1,0 +1,2 @@
+model,split_ratio,embedding_dim_k,learning_rate,epochs,threshold,val_f1,test_accuracy,test_precision,test_recall,test_f1
+FM (from scratch),70/15/15,8,0.01,50,0.15,0.326333,0.373062,0.195324,0.919753,0.32222
