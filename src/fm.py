@@ -307,7 +307,231 @@ def run_toy_example() -> None:
     numerical_gradient_check(model, idx1, idx2, y)
 
 
+# ── mini-batch training ───────────────────────────────────────────────────────
+
+def train(
+    model: FM,
+    X_train: np.ndarray,        # shape (N, 2): [drug1_id, drug2_id]
+    y_train: np.ndarray,        # shape (N,)
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    epochs: int = 20,
+    batch_size: int = 256,
+    lr: float = 0.01,
+    seed: int = SEED,
+    verbose: bool = True,
+) -> dict:
+    """
+    Mini-batch gradient descent.
+
+    Each epoch:
+      1. Shuffle the training set (reproducible with seed).
+      2. Loop over mini-batches, compute gradients, update parameters.
+      3. Compute full-dataset train loss, val loss, val F1.
+
+    Returns history dict: {train_loss, val_loss, val_f1} — one value per epoch.
+    """
+    rng = np.random.default_rng(seed)
+    N   = len(y_train)
+
+    history = {"train_loss": [], "val_loss": [], "val_f1": []}
+
+    for epoch in range(1, epochs + 1):
+        # Shuffle training rows
+        perm   = rng.permutation(N)
+        X_shuf = X_train[perm]
+        y_shuf = y_train[perm]
+
+        # Mini-batch loop
+        for start in range(0, N, batch_size):
+            xb    = X_shuf[start : start + batch_size]
+            yb    = y_shuf[start : start + batch_size]
+            grads = model.gradients(xb[:, 0], xb[:, 1], yb)
+            model.step(grads, lr)
+
+        # ── epoch-end metrics ──────────────────────────────────────────────
+        train_loss = model.loss(X_train[:, 0], X_train[:, 1], y_train)
+
+        p_val    = model.predict_proba(X_val[:, 0], X_val[:, 1])
+        val_loss = bce_loss(p_val, y_val)
+        val_f1   = f1_score(y_val, (p_val >= 0.5).astype(np.float32))
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_f1"].append(val_f1)
+
+        if verbose:
+            print(f"  Epoch {epoch:>3}/{epochs}  "
+                  f"train_loss={train_loss:.4f}  "
+                  f"val_loss={val_loss:.4f}  "
+                  f"val_f1={val_f1:.4f}")
+
+    return history
+
+
+def f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Binary F1 for the positive (Severe = 1) class."""
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    if tp == 0:
+        return 0.0
+    precision = tp / (tp + fp)
+    recall    = tp / (tp + fn)
+    return 2 * precision * recall / (precision + recall)
+
+
+# ── mini-batch walkthrough ────────────────────────────────────────────────────
+
+def show_minibatch_walkthrough(
+    model: FM,
+    X: np.ndarray,
+    y: np.ndarray,
+    batch_size: int = 4,
+    lr: float = 0.01,
+    seed: int = SEED,
+) -> None:
+    """
+    Grab a tiny batch and print every step:
+    forward pass → loss → gradients → parameter update.
+    """
+    rng   = np.random.default_rng(seed)
+    idx   = rng.choice(len(y), size=batch_size, replace=False)
+    xb    = X[idx]
+    yb    = y[idx]
+    idx1b = xb[:, 0]
+    idx2b = xb[:, 1]
+
+    print("\n" + "=" * 60)
+    print(f"MINI-BATCH WALKTHROUGH  (B = {batch_size}, lr = {lr})")
+    print("=" * 60)
+
+    # ── forward ───────────────────────────────────────────────────────────────
+    z    = model.forward(idx1b, idx2b)
+    p    = sigmoid(z)
+    loss = bce_loss(p, yb)
+
+    print(f"\n{'s':>3}  {'i':>5}  {'j':>5}  {'y':>3}  "
+          f"{'z':>8}  {'p':>8}")
+    print("-" * 40)
+    for s in range(batch_size):
+        print(f"  {s}  {idx1b[s]:>5}  {idx2b[s]:>5}  {yb[s]:>3.0f}  "
+              f"{z[s]:>8.4f}  {p[s]:>8.4f}")
+    print(f"\n  BCE loss = {loss:.6f}")
+
+    # ── gradients ─────────────────────────────────────────────────────────────
+    grads = model.gradients(idx1b, idx2b, yb)
+    r     = (p - yb) / batch_size      # normalised residuals
+
+    print(f"\n  Residuals (p - y) / B :")
+    for s in range(batch_size):
+        print(f"    s={s}  r={r[s]:+.6f}")
+
+    print(f"\n  grad_b = {grads['b']:+.8f}")
+    for s in range(batch_size):
+        i, j = int(idx1b[s]), int(idx2b[s])
+        print(f"  grad_w1[{i}] = {grads['w1'][i]:+.8f}   "
+              f"grad_w2[{j}] = {grads['w2'][j]:+.8f}")
+
+    # ── update ────────────────────────────────────────────────────────────────
+    b_old  = model.b
+    i0, j0 = int(idx1b[0]), int(idx2b[0])
+    w1_old = model.w1[i0]
+    v1_old = model.v1[i0].copy()
+
+    model.step(grads, lr)
+
+    print(f"\n  After update  (lr = {lr})")
+    print(f"    b      : {b_old:+.6f}  →  {model.b:+.6f}  "
+          f"Δ={model.b - b_old:+.2e}")
+    print(f"    w1[{i0}] : {w1_old:+.6f}  →  {model.w1[i0]:+.6f}  "
+          f"Δ={model.w1[i0] - w1_old:+.2e}")
+    print(f"    v1[{i0}] before : {v1_old}")
+    print(f"    v1[{i0}] after  : {model.v1[i0]}")
+    print("=" * 60)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os, json, csv
+    import pandas as pd
+
+    # ── 1. Toy example + gradient check (toy model) ───────────────────────────
     run_toy_example()
+
+    # ── 2. Load real splits ───────────────────────────────────────────────────
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+    DATA = os.path.join(ROOT, "data")
+
+    print("\n\nLoading real splits ...")
+    train_df = pd.read_csv(os.path.join(DATA, "split_train.csv"))
+    val_df   = pd.read_csv(os.path.join(DATA, "split_val.csv"))
+
+    with open(os.path.join(DATA, "drug_mapping.json")) as f:
+        mapping = json.load(f)
+
+    d2i    = mapping["drug_to_id"]
+    offset = mapping["drug2_offset"]
+    n_drugs = mapping["n_drugs"]
+
+    def encode(df):
+        # FM uses SEPARATE w1/w2 and v1/v2 tables, each indexed 0..n_drugs-1.
+        # No offset needed here — the offset is only for DeepFM's shared table.
+        i1 = df["Drug 1"].map(d2i).values.astype(np.int32)
+        i2 = df["Drug 2"].map(d2i).values.astype(np.int32)
+        X  = np.stack([i1, i2], axis=1)
+        y  = df["Label"].values.astype(np.float32)
+        return X, y
+
+    X_train, y_train = encode(train_df)
+    X_val,   y_val   = encode(val_df)
+    print(f"  Train rows: {len(y_train)}   Val rows: {len(y_val)}")
+
+    # ── 3. Gradient check on a real mini-batch ────────────────────────────────
+    print("\n\nGradient check on real data  (k=4, B=32)")
+    print("-" * 60)
+    rng_c = np.random.default_rng(SEED)
+    idx_c = rng_c.choice(len(y_train), 32, replace=False)
+    model_check = FM(n_drugs, k=4)
+    numerical_gradient_check(
+        model_check,
+        X_train[idx_c, 0], X_train[idx_c, 1], y_train[idx_c],
+        n_samples=6,
+    )
+
+    # ── 4. Mini-batch walkthrough (k=8, fresh model) ─────────────────────────
+    model_walk = FM(n_drugs, k=8)
+    show_minibatch_walkthrough(model_walk, X_train, y_train,
+                               batch_size=4, lr=0.01)
+
+    # ── 5. Real training run (k=8, 20 epochs) ─────────────────────────────────
+    print("\n\nTraining FM  (k=8, lr=0.01, batch_size=256, 20 epochs)")
+    print("-" * 60)
+    model = FM(n_drugs, k=8)
+    history = train(model, X_train, y_train, X_val, y_val,
+                    epochs=20, batch_size=256, lr=0.01)
+
+    # ── 6. Save checkpoint and history ────────────────────────────────────────
+    os.makedirs(os.path.join(ROOT, "models", "fm"), exist_ok=True)
+    os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
+
+    ckpt_path = os.path.join(ROOT, "models", "fm", "fm_k8.npz")
+    model.save(ckpt_path)
+
+    hist_path = os.path.join(ROOT, "results", "fm_history_k8.csv")
+    with open(hist_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["epoch", "train_loss", "val_loss", "val_f1"])
+        writer.writeheader()
+        for ep, (tl, vl, vf) in enumerate(
+                zip(history["train_loss"], history["val_loss"],
+                    history["val_f1"]), 1):
+            writer.writerow({"epoch": ep, "train_loss": tl,
+                             "val_loss": vl, "val_f1": vf})
+
+    best_ep  = int(np.argmax(history["val_f1"])) + 1
+    best_f1  = max(history["val_f1"])
+    print(f"\nCheckpoint → {ckpt_path}")
+    print(f"History    → {hist_path}")
+    print(f"Best val F1 = {best_f1:.4f}  at epoch {best_ep}")
