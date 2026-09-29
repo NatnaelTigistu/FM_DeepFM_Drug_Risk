@@ -329,3 +329,311 @@ def print_deepfm_explanation(explanation: dict, threshold: float = 0.5) -> None:
     print(f"  Prediction                    = "
           f"{'Severe (1)' if e['predicted_class'] else 'Not Severe (0)'}")
     print("=" * 56)
+
+
+# ── Training and Evaluation Utilities ─────────────────────────────────────────
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds across standard library, numpy, and torch for reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    if TORCH_AVAILABLE:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
+if TORCH_AVAILABLE:
+    class DrugPairDataset(torch.utils.data.Dataset):
+        """Dataset of drug pairs and risk labels."""
+        def __init__(self, idx1: np.ndarray, idx2: np.ndarray, labels: np.ndarray):
+            self.idx1 = torch.tensor(idx1, dtype=torch.long)
+            self.idx2 = torch.tensor(idx2, dtype=torch.long)
+            self.labels = torch.tensor(labels, dtype=torch.float32)
+
+        def __len__(self) -> int:
+            return len(self.labels)
+
+        def __getitem__(self, idx: int):
+            return self.idx1[idx], self.idx2[idx], self.labels[idx]
+
+
+def build_dataloaders(
+    train_df,
+    val_df,
+    test_df=None,
+    drug_to_id: Optional[dict] = None,
+    batch_size: int = 256,
+    seed: int = 42,
+):
+    """Create PyTorch DataLoaders for train, validation (and optionally test)."""
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for build_dataloaders.")
+
+    set_seed(seed)
+
+    def encode(df):
+        i1 = df["Drug 1"].map(drug_to_id).values.astype(np.int32)
+        i2 = df["Drug 2"].map(drug_to_id).values.astype(np.int32)
+        y = df["Label"].values.astype(np.float32)
+        return DrugPairDataset(i1, i2, y)
+
+    train_ds = encode(train_df)
+    val_ds = encode(val_df)
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, generator=g
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False
+    )
+
+    if test_df is not None:
+        test_ds = encode(test_df)
+        test_loader = torch.utils.data.DataLoader(
+            test_ds, batch_size=batch_size, shuffle=False
+        )
+        return train_loader, val_loader, test_loader
+
+    return train_loader, val_loader
+
+
+def evaluate_metrics(
+    model: "DeepFM",
+    dataloader,
+    criterion=None,
+    threshold: float = 0.5,
+    device: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Evaluate DeepFM on a dataloader and compute loss, accuracy, precision, recall, and F1.
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for evaluate_metrics.")
+
+    if device is None:
+        device = next(model.parameters()).device
+    else:
+        device = torch.device(device)
+
+    if criterion is None:
+        criterion = nn.BCEWithLogitsLoss()
+
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+
+    all_preds = []
+    all_targets = []
+    all_probs = []
+
+    with torch.no_grad():
+        for idx1, idx2, y in dataloader:
+            idx1 = idx1.to(device)
+            idx2 = idx2.to(device)
+            y = y.to(device)
+
+            logits = model(idx1, idx2)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item() * len(y)
+            total_samples += len(y)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs >= threshold).float()
+
+            all_probs.append(probs.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+
+    avg_loss = total_loss / max(total_samples, 1)
+    y_true = np.concatenate(all_targets)
+    y_pred = np.concatenate(all_preds)
+
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+
+    acc = (tp + tn) / len(y_true)
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    return {
+        "loss": avg_loss,
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+    }
+
+
+def find_best_threshold(
+    model: "DeepFM",
+    dataloader,
+    thresholds: Sequence[float] = tuple(round(t, 2) for t in np.arange(0.10, 0.65, 0.05)),
+    device: Optional[str] = None,
+) -> tuple[float, float]:
+    """Find the classification threshold that maximizes validation F1."""
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for find_best_threshold.")
+
+    if device is None:
+        device = next(model.parameters()).device
+    else:
+        device = torch.device(device)
+
+    model.eval()
+    all_probs = []
+    all_targets = []
+
+    with torch.no_grad():
+        for idx1, idx2, y in dataloader:
+            idx1 = idx1.to(device)
+            idx2 = idx2.to(device)
+            logits = model(idx1, idx2)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+
+    probs = np.concatenate(all_probs)
+    y_true = np.concatenate(all_targets)
+
+    best_thresh = 0.5
+    best_f1 = 0.0
+
+    for t in thresholds:
+        preds = (probs >= t).astype(np.float32)
+        tp = int(((preds == 1) & (y_true == 1)).sum())
+        fp = int(((preds == 1) & (y_true == 0)).sum())
+        fn = int(((preds == 0) & (y_true == 1)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = t
+
+    return best_thresh, best_f1
+
+
+def train_deepfm(
+    model: "DeepFM",
+    train_loader,
+    val_loader,
+    epochs: int = 20,
+    lr: float = 0.001,
+    weight_decay: float = 1e-5,
+    threshold: Optional[float] = None,
+    device: Optional[str] = None,
+    seed: int = 42,
+    verbose: bool = True,
+) -> dict:
+    """
+    Train DeepFM model with Adam and BCEWithLogitsLoss.
+    Tracks training loss, validation loss, accuracy, precision, recall, and F1.
+    Saves and returns the best model weights based on validation F1.
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for train_deepfm.")
+
+    set_seed(seed)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+    model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "val_precision": [],
+        "val_recall": [],
+        "val_f1": [],
+    }
+
+    best_val_f1 = -1.0
+    best_epoch = 0
+    best_state_dict = None
+    best_metrics = None
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0.0
+        total_train_samples = 0
+
+        for idx1, idx2, y in train_loader:
+            idx1 = idx1.to(device)
+            idx2 = idx2.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+            logits = model(idx1, idx2)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * len(y)
+            total_train_samples += len(y)
+
+        avg_train_loss = train_loss / max(total_train_samples, 1)
+
+        # Tune threshold dynamically if not fixed, or use fixed
+        if threshold is None:
+            curr_thresh, _ = find_best_threshold(model, val_loader, device=device)
+        else:
+            curr_thresh = threshold
+
+        val_m = evaluate_metrics(model, val_loader, criterion=criterion, threshold=curr_thresh, device=device)
+
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_m["loss"])
+        history["val_accuracy"].append(val_m["accuracy"])
+        history["val_precision"].append(val_m["precision"])
+        history["val_recall"].append(val_m["recall"])
+        history["val_f1"].append(val_m["f1"])
+
+        if val_m["f1"] > best_val_f1:
+            best_val_f1 = val_m["f1"]
+            best_epoch = epoch
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = val_m.copy()
+            best_metrics["threshold"] = curr_thresh
+            best_metrics["epoch"] = epoch
+
+        if verbose and (epoch % 5 == 0 or epoch == 1 or epoch == epochs):
+            print(
+                f"  Epoch {epoch:>2}/{epochs} | "
+                f"train_loss: {avg_train_loss:.4f} | "
+                f"val_loss: {val_m['loss']:.4f} | "
+                f"val_f1: {val_m['f1']:.4f} | "
+                f"val_acc: {val_m['accuracy']:.4f} | "
+                f"val_rec: {val_m['recall']:.4f}"
+            )
+
+    # Restore best weights
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    return {
+        "history": history,
+        "best_epoch": best_epoch,
+        "best_val_f1": best_val_f1,
+        "best_metrics": best_metrics,
+        "model": model,
+    }
+
